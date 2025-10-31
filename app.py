@@ -12,17 +12,22 @@ MATCH_THRESHOLD = 0.45                 # lower = more strict template matching
 DEBUG_SAVE = False                     # set True to save debug crop for inspection
 
 # -------------------- AUTO-LOAD A REFERENCE TEMPLATE --------------------
+# -------------------- AUTO-LOAD A REFERENCE TEMPLATE --------------------
 def load_reference_template():
-    for fname in os.listdir(TRAIN_DATA_DIR):
-        if fname.lower().startswith("genuine") and fname.lower().endswith(".png"):
-            path = os.path.join(TRAIN_DATA_DIR, fname)
+    genuine_folder = os.path.join(TRAIN_DATA_DIR, "genuine")
+    if not os.path.exists(genuine_folder):
+        raise FileNotFoundError("⚠️ 'resolution/genuine/' folder not found!")
+
+    for fname in os.listdir(genuine_folder):
+        if fname.lower().endswith(".png"):
+            path = os.path.join(genuine_folder, fname)
             tpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
             if tpl is not None:
                 print(f"✅ Loaded reference template from: {fname}")
                 return tpl
-    raise FileNotFoundError("⚠️ No genuine images found in resolution/ folder!")
 
-REF_TEMPLATE = load_reference_template()
+    raise FileNotFoundError("⚠️ No genuine images found inside 'resolution/genuine/' folder!")
+
 
 # -------------------- LOAD MODEL & SCALER --------------------
 if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
@@ -146,3 +151,4 @@ def predict():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
+
