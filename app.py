@@ -2,28 +2,23 @@ from flask import Flask, render_template, request
 import cv2, os, tempfile, numpy as np, pywt, joblib
 from scipy.stats import skew, kurtosis
 from skimage.feature import local_binary_pattern
-from skimage.metrics import structural_similarity as ssim
 
 app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-TEMPLATE_FOLDER = "ref_templates"
-GENUINE_TEMPLATE = "ref_templates/genuine_ref.png"  # your genuine pattern image here
-SSIM_THRESHOLD = 0.75  # below this => fake
-CORR_THRESHOLD = 0.70  # below this => fake
+TEMPLATE_PATH = "ref_templates/genuine_ref.png"  # your genuine reference patch
+MATCH_THRESHOLD = 0.45  # lower = more strict matching
+DEBUG_SAVE = False      # set True if you want to save cropped ROI
 
-# -------------------- PREPROCESS --------------------
-def preprocess_image(path):
-    img = cv2.imread(path)
-    if img is None:
-        raise ValueError("Unreadable image.")
-    img = cv2.resize(img, (ROI_SIZE, ROI_SIZE))
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    return img, gray
+# -------------------- LOAD MODEL & SCALER --------------------
+if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
+    raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler.pkl")
 
-# -------------------- FEATURE EXTRACTION --------------------
+rf = joblib.load("model.pkl")
+scaler = joblib.load("scaler.pkl")
+
+# -------------------- WAVELET + LBP FEATURES --------------------
 def wavelet_color_features(img, wavelet_name='db2'):
     feats = []
     for channel in cv2.split(img):
@@ -40,36 +35,56 @@ def lbp_texture_features(gray):
     return hist.tolist()
 
 def extract_features(img_color, gray):
-    f1 = wavelet_color_features(img_color)
-    f2 = lbp_texture_features(gray)
-    return np.array(f1 + f2)
+    return np.array(wavelet_color_features(img_color) + lbp_texture_features(gray))
 
-# -------------------- PATTERN MATCHING FEATURE --------------------
-def pattern_similarity_score(gray_img):
-    """Compare captured region with reference genuine template."""
-    if not os.path.exists(GENUINE_TEMPLATE):
-        return 1.0  # skip if template missing (assume genuine)
+# -------------------- ROI DETECTION --------------------
+def detect_pattern_region(img):
+    """
+    Find the region in the full image that best matches the reference pattern.
+    Returns cropped region resized to 1080x1080.
+    """
+    if not os.path.exists(TEMPLATE_PATH):
+        raise FileNotFoundError("⚠️ Genuine reference template missing in ref_templates/")
 
-    ref = cv2.imread(GENUINE_TEMPLATE, cv2.IMREAD_GRAYSCALE)
-    ref = cv2.resize(ref, (gray_img.shape[1], gray_img.shape[0]))
+    # Read both full image and reference
+    template = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # compute SSIM
-    ssim_val = ssim(gray_img, ref)
+    # Resize template smaller for matching speed
+    scales = [0.5, 0.75, 1.0, 1.25]
+    best_val, best_loc, best_size = -1, None, None
 
-    # compute normalized cross-correlation
-    corr = cv2.matchTemplate(gray_img, ref, cv2.TM_CCOEFF_NORMED).max()
+    for s in scales:
+        tpl = cv2.resize(template, (int(template.shape[1]*s), int(template.shape[0]*s)))
+        res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
 
-    # combine for final similarity score
-    return (ssim_val + corr) / 2.0
+        if maxVal > best_val:
+            best_val = maxVal
+            best_loc = maxLoc
+            best_size = tpl.shape[::-1]  # (width, height)
 
-# -------------------- LOAD MODEL & SCALER --------------------
-if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
-    raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler.pkl")
+    if best_val < MATCH_THRESHOLD:
+        raise ValueError("Pattern not found clearly (try closer shot or better lighting)")
 
-rf = joblib.load("model.pkl")
-scaler = joblib.load("scaler.pkl")
+    tw, th = best_size
+    x, y = best_loc
+    cx, cy = x + tw//2, y + th//2
 
-# -------------------- ROUTES --------------------
+    # Crop around detected region
+    pad = int(max(tw, th) * 0.5)
+    x1, y1 = max(0, cx - pad), max(0, cy - pad)
+    x2, y2 = min(img.shape[1], cx + pad), min(img.shape[0], cy + pad)
+    crop = img[y1:y2, x1:x2].copy()
+
+    # Resize to 1080x1080
+    crop_resized = cv2.resize(crop, (ROI_SIZE, ROI_SIZE))
+    if DEBUG_SAVE:
+        cv2.imwrite("debug_crop.png", crop_resized)
+
+    return crop_resized
+
+# -------------------- PREDICTION --------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -84,25 +99,34 @@ def predict():
         temp_path = os.path.join(tempfile.gettempdir(), file.filename)
         file.save(temp_path)
 
-        img_color, gray = preprocess_image(temp_path)
-        features = extract_features(img_color, gray).reshape(1, -1)
-        features = scaler.transform(features)
+        img = cv2.imread(temp_path)
+        if img is None:
+            raise ValueError("Invalid image.")
 
-        proba = rf.predict_proba(features)[0]
+        # 1️⃣ Detect region
+        roi = detect_pattern_region(img)
+
+        # 2️⃣ Preprocess cropped region
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+
+        # 3️⃣ Extract features
+        feats = extract_features(roi, gray).reshape(1, -1)
+        feats = scaler.transform(feats)
+
+        # 4️⃣ Predict
+        proba = rf.predict_proba(feats)[0]
         genuine_prob = float(proba[1])
 
-        # calculate pattern similarity
-        similarity = pattern_similarity_score(gray)
-
-        # hybrid decision
-        if similarity < SSIM_THRESHOLD or genuine_prob < 0.55:
-            result = "❌ Fake Note"
-        elif genuine_prob > 0.85 and similarity > 0.8:
+        # 5️⃣ Decision
+        if genuine_prob >= 0.9:
             result = "✅ Genuine Note"
+        elif genuine_prob <= 0.6:
+            result = "❌ Fake Note"
         else:
             result = "⚠️ Suspicious Note"
 
-        confidence = f"{genuine_prob:.2f} | PatternSim: {similarity:.2f}"
+        confidence = f"{genuine_prob:.2f}"
 
         os.remove(temp_path)
         return render_template("result.html", result=result, confidence=confidence)
