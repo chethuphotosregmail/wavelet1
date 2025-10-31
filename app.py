@@ -7,9 +7,22 @@ app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-TEMPLATE_PATH = "ref_templates/genuine_ref.png"  # your genuine reference patch
-MATCH_THRESHOLD = 0.45  # lower = more strict matching
-DEBUG_SAVE = False      # set True if you want to save cropped ROI
+TRAIN_DATA_DIR = "resolution"          # your training data folder
+MATCH_THRESHOLD = 0.45                 # lower = more strict template matching
+DEBUG_SAVE = False                     # set True to save debug crop for inspection
+
+# -------------------- AUTO-LOAD A REFERENCE TEMPLATE --------------------
+def load_reference_template():
+    for fname in os.listdir(TRAIN_DATA_DIR):
+        if fname.lower().startswith("genuine") and fname.lower().endswith(".png"):
+            path = os.path.join(TRAIN_DATA_DIR, fname)
+            tpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if tpl is not None:
+                print(f"✅ Loaded reference template from: {fname}")
+                return tpl
+    raise FileNotFoundError("⚠️ No genuine images found in resolution/ folder!")
+
+REF_TEMPLATE = load_reference_template()
 
 # -------------------- LOAD MODEL & SCALER --------------------
 if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
@@ -18,7 +31,7 @@ if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
 rf = joblib.load("model.pkl")
 scaler = joblib.load("scaler.pkl")
 
-# -------------------- WAVELET + LBP FEATURES --------------------
+# -------------------- FEATURE EXTRACTION --------------------
 def wavelet_color_features(img, wavelet_name='db2'):
     feats = []
     for channel in cv2.split(img):
@@ -40,17 +53,13 @@ def extract_features(img_color, gray):
 # -------------------- ROI DETECTION --------------------
 def detect_pattern_region(img):
     """
-    Find the region in the full image that best matches the reference pattern.
+    Detect region in full note image that matches any known genuine pattern region.
     Returns cropped region resized to 1080x1080.
     """
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError("⚠️ Genuine reference template missing in ref_templates/")
-
-    # Read both full image and reference
-    template = cv2.imread(TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    template = REF_TEMPLATE
 
-    # Resize template smaller for matching speed
+    # Try matching at multiple scales
     scales = [0.5, 0.75, 1.0, 1.25]
     best_val, best_loc, best_size = -1, None, None
 
@@ -65,13 +74,13 @@ def detect_pattern_region(img):
             best_size = tpl.shape[::-1]  # (width, height)
 
     if best_val < MATCH_THRESHOLD:
-        raise ValueError("Pattern not found clearly (try closer shot or better lighting)")
+        raise ValueError("Pattern not found clearly — try closer or clearer image")
 
     tw, th = best_size
     x, y = best_loc
-    cx, cy = x + tw//2, y + th//2
+    cx, cy = x + tw // 2, y + th // 2
 
-    # Crop around detected region
+    # Crop region around detected pattern
     pad = int(max(tw, th) * 0.5)
     x1, y1 = max(0, cx - pad), max(0, cy - pad)
     x2, y2 = min(img.shape[1], cx + pad), min(img.shape[0], cy + pad)
@@ -84,7 +93,7 @@ def detect_pattern_region(img):
 
     return crop_resized
 
-# -------------------- PREDICTION --------------------
+# -------------------- FLASK ROUTES --------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -101,16 +110,16 @@ def predict():
 
         img = cv2.imread(temp_path)
         if img is None:
-            raise ValueError("Invalid image.")
+            raise ValueError("Invalid image file.")
 
-        # 1️⃣ Detect region
+        # 1️⃣ Detect ROI using template-based pattern detection
         roi = detect_pattern_region(img)
 
         # 2️⃣ Preprocess cropped region
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
 
-        # 3️⃣ Extract features
+        # 3️⃣ Extract & scale features
         feats = extract_features(roi, gray).reshape(1, -1)
         feats = scaler.transform(feats)
 
