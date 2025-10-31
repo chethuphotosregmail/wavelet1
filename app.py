@@ -7,13 +7,16 @@ app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-TRAIN_DATA_DIR = "resolution"          # your training data folder
-MATCH_THRESHOLD = 0.45                 # lower = more strict template matching
-DEBUG_SAVE = False                     # set True to save debug crop for inspection
+TRAIN_DATA_DIR = "resolution"
+MATCH_THRESHOLD = 0.45
+DEBUG_SAVE = False
 
-# -------------------- AUTO-LOAD A REFERENCE TEMPLATE --------------------
-# -------------------- AUTO-LOAD A REFERENCE TEMPLATE --------------------
+# -------------------- LOAD REFERENCE TEMPLATE --------------------
 def load_reference_template():
+    """
+    Automatically loads one genuine training image from resolution/genuine/
+    and uses it as a pattern reference for automatic cropping.
+    """
     genuine_folder = os.path.join(TRAIN_DATA_DIR, "genuine")
     if not os.path.exists(genuine_folder):
         raise FileNotFoundError("⚠️ 'resolution/genuine/' folder not found!")
@@ -28,6 +31,8 @@ def load_reference_template():
 
     raise FileNotFoundError("⚠️ No genuine images found inside 'resolution/genuine/' folder!")
 
+# Load reference image automatically
+REF_TEMPLATE = load_reference_template()
 
 # -------------------- LOAD MODEL & SCALER --------------------
 if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
@@ -58,13 +63,12 @@ def extract_features(img_color, gray):
 # -------------------- ROI DETECTION --------------------
 def detect_pattern_region(img):
     """
-    Detect region in full note image that matches any known genuine pattern region.
-    Returns cropped region resized to 1080x1080.
+    Detect the region in the full captured image that matches your genuine pattern.
+    Automatically crops it and resizes to 1080x1080.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     template = REF_TEMPLATE
 
-    # Try matching at multiple scales
     scales = [0.5, 0.75, 1.0, 1.25]
     best_val, best_loc, best_size = -1, None, None
 
@@ -72,30 +76,26 @@ def detect_pattern_region(img):
         tpl = cv2.resize(template, (int(template.shape[1]*s), int(template.shape[0]*s)))
         res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
         minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
-
         if maxVal > best_val:
             best_val = maxVal
             best_loc = maxLoc
             best_size = tpl.shape[::-1]  # (width, height)
 
     if best_val < MATCH_THRESHOLD:
-        raise ValueError("Pattern not found clearly — try closer or clearer image")
+        raise ValueError("Pattern not found clearly — try closer or clearer photo")
 
     tw, th = best_size
     x, y = best_loc
     cx, cy = x + tw // 2, y + th // 2
 
-    # Crop region around detected pattern
     pad = int(max(tw, th) * 0.5)
     x1, y1 = max(0, cx - pad), max(0, cy - pad)
     x2, y2 = min(img.shape[1], cx + pad), min(img.shape[0], cy + pad)
     crop = img[y1:y2, x1:x2].copy()
 
-    # Resize to 1080x1080
     crop_resized = cv2.resize(crop, (ROI_SIZE, ROI_SIZE))
     if DEBUG_SAVE:
         cv2.imwrite("debug_crop.png", crop_resized)
-
     return crop_resized
 
 # -------------------- FLASK ROUTES --------------------
@@ -112,27 +112,19 @@ def predict():
 
         temp_path = os.path.join(tempfile.gettempdir(), file.filename)
         file.save(temp_path)
-
         img = cv2.imread(temp_path)
         if img is None:
-            raise ValueError("Invalid image file.")
+            raise ValueError("Invalid image.")
 
-        # 1️⃣ Detect ROI using template-based pattern detection
         roi = detect_pattern_region(img)
-
-        # 2️⃣ Preprocess cropped region
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
 
-        # 3️⃣ Extract & scale features
         feats = extract_features(roi, gray).reshape(1, -1)
         feats = scaler.transform(feats)
-
-        # 4️⃣ Predict
         proba = rf.predict_proba(feats)[0]
         genuine_prob = float(proba[1])
 
-        # 5️⃣ Decision
         if genuine_prob >= 0.9:
             result = "✅ Genuine Note"
         elif genuine_prob <= 0.6:
@@ -141,8 +133,8 @@ def predict():
             result = "⚠️ Suspicious Note"
 
         confidence = f"{genuine_prob:.2f}"
-
         os.remove(temp_path)
+
         return render_template("result.html", result=result, confidence=confidence)
 
     except Exception as e:
@@ -151,4 +143,3 @@ def predict():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
-
