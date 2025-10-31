@@ -10,16 +10,24 @@
     body {
       background: #0f0408;
       color: white;
+      text-align: center;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
+      justify-content: flex-start;
       height: 100vh;
-      padding: 10px;
+      padding: 15px;
     }
     img {
       max-width: 100%;
       display: block;
+      margin: 0 auto;
+    }
+    #cropContainer {
+      width: 100%;
+      height: 70vh;
+      margin-top: 15px;
+      display: none;
     }
     .btn-custom {
       background-color: #ffd500;
@@ -35,13 +43,13 @@
   <form id="uploadForm" method="POST" enctype="multipart/form-data" action="/predict">
     <input type="file" id="fileInput" name="file" accept="image/*" capture="environment" class="form-control mb-3" required>
     
-    <div id="cropContainer" style="display:none;">
+    <div id="cropContainer">
       <img id="imagePreview" />
-      <button type="button" class="btn btn-warning mt-2" id="cropButton">✂️ Crop & Continue</button>
+      <button type="button" class="btn btn-warning mt-3" id="cropButton">✂️ Crop & Continue</button>
     </div>
     
     <input type="hidden" name="croppedImage" id="croppedImage">
-    <button type="submit" class="btn btn-custom mt-3" id="submitButton" style="display:none;">🔍 Classify Note</button>
+    <button type="submit" class="btn btn-custom mt-4" id="submitButton" style="display:none;">🔍 Classify Note</button>
   </form>
 
   <script src="https://cdn.jsdelivr.net/npm/cropperjs@1.5.13/dist/cropper.min.js"></script>
@@ -50,7 +58,6 @@
     const imagePreview = document.getElementById('imagePreview');
     const cropContainer = document.getElementById('cropContainer');
     const cropButton = document.getElementById('cropButton');
-    const croppedImageInput = document.getElementById('croppedImage');
     const submitButton = document.getElementById('submitButton');
     let cropper;
 
@@ -62,8 +69,20 @@
           imagePreview.src = event.target.result;
           cropContainer.style.display = 'block';
           submitButton.style.display = 'none';
+
+          // Destroy any existing cropper
           if (cropper) cropper.destroy();
-          cropper = new Cropper(imagePreview, { aspectRatio: 16 / 9, viewMode: 1 });
+
+          // Create new cropper with large region and zoom-to-fit
+          cropper = new Cropper(imagePreview, {
+            aspectRatio: NaN,         // free crop
+            viewMode: 1,
+            autoCropArea: 0.9,        // make crop box 90% of image by default
+            background: false,
+            movable: true,
+            zoomable: true,
+            responsive: true
+          });
         };
         reader.readAsDataURL(file);
       }
