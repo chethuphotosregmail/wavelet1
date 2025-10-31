@@ -7,32 +7,9 @@ app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-TRAIN_DATA_DIR = "resolution"
-MATCH_THRESHOLD = 0.45
-DEBUG_SAVE = False
-
-# -------------------- LOAD REFERENCE TEMPLATE --------------------
-def load_reference_template():
-    """
-    Automatically loads one genuine training image from resolution/genuine/
-    and uses it as a pattern reference for automatic cropping.
-    """
-    genuine_folder = os.path.join(TRAIN_DATA_DIR, "genuine")
-    if not os.path.exists(genuine_folder):
-        raise FileNotFoundError("⚠️ 'resolution/genuine/' folder not found!")
-
-    for fname in os.listdir(genuine_folder):
-        if fname.lower().endswith(".png"):
-            path = os.path.join(genuine_folder, fname)
-            tpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if tpl is not None:
-                print(f"✅ Loaded reference template from: {fname}")
-                return tpl
-
-    raise FileNotFoundError("⚠️ No genuine images found inside 'resolution/genuine/' folder!")
-
-# Load reference image automatically
-REF_TEMPLATE = load_reference_template()
+WINDOW_SIZE_RATIO = 0.25  # portion of image scanned per window (adjustable)
+PADDING = 20              # padding around detected ROI
+DEBUG_SAVE = False         # True = save cropped image for debug
 
 # -------------------- LOAD MODEL & SCALER --------------------
 if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
@@ -60,43 +37,44 @@ def lbp_texture_features(gray):
 def extract_features(img_color, gray):
     return np.array(wavelet_color_features(img_color) + lbp_texture_features(gray))
 
-# -------------------- ROI DETECTION --------------------
-def detect_pattern_region(img):
+# -------------------- ROI DETECTION (NO TEMPLATE NEEDED) --------------------
+def detect_roi_by_texture(img):
     """
-    Detect the region in the full captured image that matches your genuine pattern.
-    Automatically crops it and resizes to 1080x1080.
+    Automatically finds the region of highest texture energy using Laplacian variance.
+    Crops that region and resizes to 1080x1080.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    template = REF_TEMPLATE
+    h, w = gray.shape
 
-    scales = [0.5, 0.75, 1.0, 1.25]
-    best_val, best_loc, best_size = -1, None, None
+    win = max(64, int(min(h, w) * WINDOW_SIZE_RATIO))
+    step = max(16, win // 4)
 
-    for s in scales:
-        tpl = cv2.resize(template, (int(template.shape[1]*s), int(template.shape[0]*s)))
-        res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
-        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
-        if maxVal > best_val:
-            best_val = maxVal
-            best_loc = maxLoc
-            best_size = tpl.shape[::-1]  # (width, height)
+    best_score = -1
+    best_box = (0, 0, w, h)
 
-    if best_val < MATCH_THRESHOLD:
-        raise ValueError("Pattern not found clearly — try closer or clearer photo")
+    # Slide window and measure texture (sharpness)
+    for y in range(0, h - win + 1, step):
+        for x in range(0, w - win + 1, step):
+            patch = gray[y:y+win, x:x+win]
+            score = cv2.Laplacian(patch, cv2.CV_64F).var()  # Laplacian variance
+            if score > best_score:
+                best_score = score
+                best_box = (x, y, win, win)
 
-    tw, th = best_size
-    x, y = best_loc
-    cx, cy = x + tw // 2, y + th // 2
+    x, y, win, _ = best_box
+    cx, cy = x + win // 2, y + win // 2
 
-    pad = int(max(tw, th) * 0.5)
+    # Crop around best region
+    pad = int(win * 0.5)
     x1, y1 = max(0, cx - pad), max(0, cy - pad)
-    x2, y2 = min(img.shape[1], cx + pad), min(img.shape[0], cy + pad)
-    crop = img[y1:y2, x1:x2].copy()
+    x2, y2 = min(w, cx + pad), min(h, cy + pad)
+    roi = img[y1:y2, x1:x2].copy()
 
-    crop_resized = cv2.resize(crop, (ROI_SIZE, ROI_SIZE))
+    # Resize to 1080x1080
+    roi_resized = cv2.resize(roi, (ROI_SIZE, ROI_SIZE))
     if DEBUG_SAVE:
-        cv2.imwrite("debug_crop.png", crop_resized)
-    return crop_resized
+        cv2.imwrite("debug_roi.png", roi_resized)
+    return roi_resized
 
 # -------------------- FLASK ROUTES --------------------
 @app.route("/")
@@ -116,15 +94,22 @@ def predict():
         if img is None:
             raise ValueError("Invalid image.")
 
-        roi = detect_pattern_region(img)
+        # 1️⃣ Auto-detect region with most detailed pattern
+        roi = detect_roi_by_texture(img)
+
+        # 2️⃣ Convert to grayscale + equalize
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
 
+        # 3️⃣ Extract features
         feats = extract_features(roi, gray).reshape(1, -1)
         feats = scaler.transform(feats)
+
+        # 4️⃣ Predict with trained model
         proba = rf.predict_proba(feats)[0]
         genuine_prob = float(proba[1])
 
+        # 5️⃣ Decision
         if genuine_prob >= 0.9:
             result = "✅ Genuine Note"
         elif genuine_prob <= 0.6:
@@ -133,8 +118,8 @@ def predict():
             result = "⚠️ Suspicious Note"
 
         confidence = f"{genuine_prob:.2f}"
-        os.remove(temp_path)
 
+        os.remove(temp_path)
         return render_template("result.html", result=result, confidence=confidence)
 
     except Exception as e:
