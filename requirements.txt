@@ -5,3 +5,4 @@ PyWavelets
 scipy
 scikit-learn
 scikit-image
+joblib
