@@ -148,13 +148,23 @@ def predict():
         proba = rf.predict_proba(feats)[0]
         genuine_prob = float(proba[1])
 
-        # ---- Decision ----
-        if genuine_prob >= 0.9:
+        # ---- Post-check: Xerox filter ----
+        # Measure reflection and texture smoothness directly from gray
+        bright_ratio = np.sum(gray > 220) / gray.size  # reflective spots
+        edges = cv2.Canny(gray, 80, 160)
+        micro_edge_density = np.sum(edges > 0) / edges.size
+        edge_std = np.std(edges.astype(np.float32)) / 255.0
+        gray_std = np.std(gray) / 255.0  # tonal variation
+
+        # Xerox characteristics → very low reflection, uniform edges, low tonal variance
+        if (genuine_prob >= 0.8) and (bright_ratio < 0.001 or gray_std < 0.06) and (edge_std < 0.02):
+            result = "⚠️ Possible Xerox Copy (Fake Surface Reflection)"
+        elif genuine_prob >= 0.9:
             result = "✅ Genuine "
         elif genuine_prob <= 0.6:
             result = "❌ Fake "
         else:
-            result = "⚠️ Suspicious"
+            result = "⚠️ Suspicious "
 
         confidence = f"{genuine_prob:.2f}"
 
@@ -166,6 +176,8 @@ def predict():
         return render_template("result.html", result=f"❌ Error: {str(e)}")
 
 
+
 # -------------------- 5. RUN --------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
+
