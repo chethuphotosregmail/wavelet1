@@ -7,23 +7,20 @@ app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-DEBUG_SAVE = False  # set True to save cropped ROI
+DEBUG_SAVE = False  # Set True to save cropped ROI image for debugging
 
 # -------------------- MODEL LOADING --------------------
-if not os.path.exists("model_v4.pkl") or not os.path.exists("scaler_v4.pkl"):
-    raise FileNotFoundError("⚠️ Run train_model_v4.py first to generate model_v4.pkl and scaler_v4.pkl")
+if not os.path.exists("model_v5.pkl") or not os.path.exists("scaler_v5.pkl"):
+    raise FileNotFoundError("⚠️ Run train_model_v5.py first to generate model_v5.pkl and scaler_v5.pkl")
 
-rf = joblib.load("model_v4.pkl")
-scaler = joblib.load("scaler_v4.pkl")
-print("✅ model_v4 & scaler_v4 loaded successfully!")
+rf = joblib.load("model_v5.pkl")
+scaler = joblib.load("scaler_v5.pkl")
+print("✅ model_v5 & scaler_v5 loaded successfully!")
 
 
 # -------------------- 1. DETECT NOTE AREA --------------------
 def detect_note_region(img):
-    """
-    Detects the largest rectangular contour (note area)
-    and crops it tightly before resizing.
-    """
+    """Detects the largest rectangular contour (main note/patch area) and crops it."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
     edges = cv2.Canny(gray, 50, 150)
@@ -43,9 +40,7 @@ def detect_note_region(img):
 
 # -------------------- 2. PREPROCESSING --------------------
 def preprocess_image(path, size=(ROI_SIZE, ROI_SIZE)):
-    """
-    Read image, detect note, crop, convert to grayscale, apply CLAHE, and resize.
-    """
+    """Read image, detect note region, crop, convert to grayscale with CLAHE, and resize."""
     img = cv2.imread(path)
     if img is None:
         raise ValueError("Invalid or unreadable image file.")
@@ -82,36 +77,46 @@ def lbp_texture_features(gray):
 
 
 def extract_features(img_color, gray):
-    """Combine Wavelet, LBP, and Xerox-aware reflection/texture features."""
+    """Enhanced feature extraction combining wavelet, LBP, and Xerox-aware micro-texture features."""
     feats = wavelet_color_features(img_color) + lbp_texture_features(gray)
 
-    # --- 1. Sharpness / contrast / reflection metrics ---
+    # --- Sharpness / contrast / reflection metrics ---
     lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     blur = cv2.GaussianBlur(gray, (9, 9), 0)
     contrast_map = cv2.absdiff(gray, blur)
     contrast_std = np.std(contrast_map)
     bright_ratio = np.sum(gray > 220) / gray.size
 
-    # --- 2. Xerox-aware features ---
-    # Reflection clusters
+    # --- Reflection density ---
     bright_mask = cv2.inRange(gray, 230, 255)
     contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     reflection_clusters = len([c for c in contours if 5 < cv2.contourArea(c) < 200])
     reflection_density = reflection_clusters / (gray.shape[0] * gray.shape[1] / 10000)
 
-    # Local color variance
+    # --- Color variance ---
     color_std = np.std(cv2.cvtColor(img_color, cv2.COLOR_BGR2LAB)[:, :, 0])
 
-    # Edge uniformity (flat edges in Xerox copies)
+    # --- Edge uniformity ---
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     edge_mag = np.sqrt(sobelx ** 2 + sobely ** 2)
     edge_uniformity = 1 / (np.std(edge_mag) + 1e-5)
 
-    # Add all
+    # --- Micro-edge density (real has denser micro lines) ---
+    edges = cv2.Canny(gray, 80, 160)
+    micro_edge_density = np.sum(edges > 0) / edges.size
+
+    # --- Specular highlight ratio (reflective ink regions) ---
+    specular_ratio = np.sum(gray > 245) / gray.size
+
+    # --- Texture coarseness index (fine vs flat surface) ---
+    highpass = gray - cv2.GaussianBlur(gray, (5, 5), 0)
+    texture_coarseness = np.std(highpass)
+
     feats.extend([
-        lap_var, contrast_std, bright_ratio,
-        reflection_density, color_std, edge_uniformity
+        lap_var, contrast_std, bright_ratio, reflection_density,
+        color_std, edge_uniformity, micro_edge_density,
+        specular_ratio, texture_coarseness
     ])
     return np.array(feats)
 
