@@ -1,8 +1,9 @@
 from flask import Flask, render_template, request
 import cv2, os, tempfile, numpy as np, pywt, joblib
 from scipy.stats import skew, kurtosis
-from skimage.feature import local_binary_pattern, hog
+from skimage.feature import local_binary_pattern
 from sklearn.metrics.pairwise import cosine_similarity
+from skimage.feature import hog
 
 app = Flask(__name__)
 
@@ -19,7 +20,7 @@ scaler = joblib.load("scaler_v5.pkl")
 print("✅ Model_v5 & Scaler_v5 loaded successfully!")
 
 
-# ---------------- REFERENCE PATTERN ----------------
+# ---------------- HOG REFERENCE ----------------
 def compute_reference_hog():
     hogs = []
     for fname in os.listdir(GENUINE_REF_DIR):
@@ -37,15 +38,10 @@ def compute_reference_hog():
         return None
     return np.mean(hogs, axis=0)
 
-print("📘 Generating reference HOG pattern from genuine samples...")
 REF_HOG = compute_reference_hog()
-if REF_HOG is None:
-    print("⚠️ Warning: No genuine reference images found.")
-else:
-    print("✅ Reference pattern signature ready.")
 
 
-# ---------------- PREPROCESS ----------------
+# ---------------- IMAGE PREPROCESS ----------------
 def detect_note_region(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (7, 7), 0), 60, 160)
@@ -66,12 +62,8 @@ def preprocess_image(path, size=(ROI_SIZE, ROI_SIZE)):
     img = detect_note_region(img)
     img = cv2.resize(img, size)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # normalize lighting
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
-
-    # mobile lighting correction
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
     return img, gray
 
@@ -119,6 +111,25 @@ def extract_features(img_color, gray):
     return np.array(feats, dtype=np.float32)
 
 
+# ---------------- HELPER METRICS ----------------
+def compute_micro_entropy(gray):
+    """Measures tiny irregular brightness variations that Xerox copies lack."""
+    patch_std = []
+    for i in range(0, gray.shape[0], 40):
+        for j in range(0, gray.shape[1], 40):
+            patch = gray[i:i+40, j:j+40]
+            if patch.size > 0:
+                patch_std.append(np.std(patch))
+    return np.mean(patch_std)
+
+
+def compute_reflective_irregularity(gray):
+    """Detects uneven micro-glare (present in real notes)."""
+    blur = cv2.GaussianBlur(gray, (11, 11), 0)
+    diff = cv2.absdiff(gray, blur)
+    return np.std(diff)
+
+
 # ---------------- PREDICT ----------------
 @app.route("/")
 def index():
@@ -134,41 +145,33 @@ def predict():
 
         temp_path = os.path.join(tempfile.gettempdir(), file.filename)
         file.save(temp_path)
-
         img_color, gray = preprocess_image(temp_path)
+
         feats = extract_features(img_color, gray).reshape(1, -1)
         feats_scaled = scaler.transform(feats)
         proba = rf.predict_proba(feats_scaled)[0]
         genuine_prob = float(proba[1])
 
-        # --- Pattern and Reflectivity Checks ---
-        reflectivity = np.sum(gray > 230) / gray.size
-        reflection_strength = np.std(cv2.GaussianBlur(gray, (5, 5), 0))
+        # --- Structure and Reflection ---
         test_hog = hog(cv2.resize(gray, (256, 256)), orientations=9,
                        pixels_per_cell=(16, 16), cells_per_block=(2, 2),
                        visualize=False, block_norm='L2-Hys')
-        pattern_similarity = (
-            cosine_similarity([REF_HOG], [test_hog])[0][0] if REF_HOG is not None else 0.0
-        )
+        pattern_similarity = cosine_similarity([REF_HOG], [test_hog])[0][0] if REF_HOG is not None else 0.0
 
-        # --- Adjust pattern score based on reflectivity ---
-        if reflectivity < 0.001:
-            pattern_similarity *= 0.85  # penalize flat Xerox
-        elif reflectivity > 0.002:
-            pattern_similarity *= 1.05  # boost for real reflective note
-            pattern_similarity = min(pattern_similarity, 1.0)
+        micro_entropy = compute_micro_entropy(gray)
+        reflect_irregularity = compute_reflective_irregularity(gray)
 
-        # --- Final Decision ---
-        if genuine_prob >= 0.9 and pattern_similarity > 0.85 and reflectivity > 0.001:
+        # --- Decision ---
+        if (genuine_prob > 0.85 and micro_entropy > 18 and reflect_irregularity > 10):
             result = "✅ Genuine Note"
-        elif genuine_prob >= 0.8 and pattern_similarity > 0.75 and reflectivity > 0.0008:
+        elif (pattern_similarity > 0.8 and micro_entropy > 14):
             result = "⚠️ Likely Genuine (Low Light)"
         else:
             result = "❌ Fake / Xerox Detected"
 
-        confidence = f"{genuine_prob:.2f} | Pattern: {pattern_similarity:.2f} | Reflectivity: {reflectivity:.5f}"
-        os.remove(temp_path)
+        confidence = f"Model: {genuine_prob:.2f} | Pattern: {pattern_similarity:.2f} | Entropy: {micro_entropy:.2f} | Irregularity: {reflect_irregularity:.2f}"
 
+        os.remove(temp_path)
         return render_template("result.html", result=result, confidence=confidence)
 
     except Exception as e:
