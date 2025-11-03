@@ -1,24 +1,74 @@
-from flask import Flask, render_template, request
-import cv2, os, tempfile, numpy as np, pywt, joblib
-from scipy.stats import skew, kurtosis
-from skimage.feature import local_binary_pattern
+from flask import Flask, render_template, request  # type: ignore
+import cv2, os, tempfile, numpy as np, pywt, joblib  # type: ignore
+from scipy.stats import skew, kurtosis  # type: ignore
+from skimage.feature import local_binary_pattern  # type: ignore
 
 app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-WINDOW_SIZE_RATIO = 0.25  # portion of image scanned per window (adjustable)
-PADDING = 20              # padding around detected ROI
-DEBUG_SAVE = False         # True = save cropped image for debug
+DEBUG_SAVE = False  # set to True to save cropped ROI for inspection
 
-# -------------------- LOAD MODEL & SCALER --------------------
+# -------------------- MODEL LOADING --------------------
 if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
     raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler.pkl")
 
 rf = joblib.load("model.pkl")
 scaler = joblib.load("scaler.pkl")
+print("✅ Model & scaler loaded successfully!")
 
-# -------------------- FEATURE EXTRACTION --------------------
+
+# -------------------- 1. DETECT NOTE AREA --------------------
+def detect_note_region(img):
+    """
+    Detects the largest rectangular-like contour (note area)
+    and crops it tightly before resizing.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img  # fallback if nothing detected
+
+    contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(contour)
+
+    if w * h < 0.2 * img.shape[0] * img.shape[1]:  # too small to be a note
+        return img
+
+    cropped = img[y:y+h, x:x+w]
+    return cropped
+
+
+# -------------------- 2. PREPROCESSING --------------------
+def preprocess_image(path, size=(1080, 1080)):
+    """
+    Read image, detect note, crop, convert to grayscale with CLAHE, and resize.
+    """
+    img = cv2.imread(path)
+    if img is None:
+        raise ValueError("Invalid or unreadable image.")
+
+    # Detect and crop the main note region
+    note_roi = detect_note_region(img)
+
+    # Resize to square 1080x1080
+    note_roi = cv2.resize(note_roi, size)
+
+    # Grayscale and normalize lighting (CLAHE)
+    gray = cv2.cvtColor(note_roi, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    if DEBUG_SAVE:
+        cv2.imwrite("debug_roi.png", note_roi)
+
+    return note_roi, gray
+
+
+# -------------------- 3. FEATURE EXTRACTION --------------------
 def wavelet_color_features(img, wavelet_name='db2'):
     feats = []
     for channel in cv2.split(img):
@@ -29,57 +79,22 @@ def wavelet_color_features(img, wavelet_name='db2'):
             feats.extend([np.var(hist), skew(hist), kurtosis(hist)])
     return feats
 
+
 def lbp_texture_features(gray):
     lbp = local_binary_pattern(gray, P=8, R=1, method="uniform")
     hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 59), density=True)
     return hist.tolist()
 
+
 def extract_features(img_color, gray):
     return np.array(wavelet_color_features(img_color) + lbp_texture_features(gray))
 
-# -------------------- ROI DETECTION (NO TEMPLATE NEEDED) --------------------
-def detect_roi_by_texture(img):
-    """
-    Automatically finds the region of highest texture energy using Laplacian variance.
-    Crops that region and resizes to 1080x1080.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
 
-    win = max(64, int(min(h, w) * WINDOW_SIZE_RATIO))
-    step = max(16, win // 4)
-
-    best_score = -1
-    best_box = (0, 0, w, h)
-
-    # Slide window and measure texture (sharpness)
-    for y in range(0, h - win + 1, step):
-        for x in range(0, w - win + 1, step):
-            patch = gray[y:y+win, x:x+win]
-            score = cv2.Laplacian(patch, cv2.CV_64F).var()  # Laplacian variance
-            if score > best_score:
-                best_score = score
-                best_box = (x, y, win, win)
-
-    x, y, win, _ = best_box
-    cx, cy = x + win // 2, y + win // 2
-
-    # Crop around best region
-    pad = int(win * 0.5)
-    x1, y1 = max(0, cx - pad), max(0, cy - pad)
-    x2, y2 = min(w, cx + pad), min(h, cy + pad)
-    roi = img[y1:y2, x1:x2].copy()
-
-    # Resize to 1080x1080
-    roi_resized = cv2.resize(roi, (ROI_SIZE, ROI_SIZE))
-    if DEBUG_SAVE:
-        cv2.imwrite("debug_roi.png", roi_resized)
-    return roi_resized
-
-# -------------------- FLASK ROUTES --------------------
+# -------------------- 4. FLASK ROUTES --------------------
 @app.route("/")
 def index():
     return render_template("index.html")
+
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -90,26 +105,19 @@ def predict():
 
         temp_path = os.path.join(tempfile.gettempdir(), file.filename)
         file.save(temp_path)
-        img = cv2.imread(temp_path)
-        if img is None:
-            raise ValueError("Invalid image.")
 
-        # 1️⃣ Auto-detect region with most detailed pattern
-        roi = detect_roi_by_texture(img)
+        # ---- Preprocess ----
+        img_color, gray = preprocess_image(temp_path)
 
-        # 2️⃣ Convert to grayscale + equalize
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-
-        # 3️⃣ Extract features
-        feats = extract_features(roi, gray).reshape(1, -1)
+        # ---- Extract & Scale ----
+        feats = extract_features(img_color, gray).reshape(1, -1)
         feats = scaler.transform(feats)
 
-        # 4️⃣ Predict with trained model
+        # ---- Predict ----
         proba = rf.predict_proba(feats)[0]
         genuine_prob = float(proba[1])
 
-        # 5️⃣ Decision
+        # ---- Decision ----
         if genuine_prob >= 0.9:
             result = "✅ Genuine Note"
         elif genuine_prob <= 0.6:
@@ -126,5 +134,7 @@ def predict():
         print("Error:", e)
         return render_template("result.html", result=f"❌ Error: {str(e)}")
 
+
+# -------------------- 5. RUN --------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
