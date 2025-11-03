@@ -10,11 +10,11 @@ ROI_SIZE = 1080
 DEBUG_SAVE = False  # set to True to save cropped ROI for inspection
 
 # -------------------- MODEL LOADING --------------------
-if not os.path.exists("model.pkl") or not os.path.exists("scaler.pkl"):
-    raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler.pkl")
+if not os.path.exists("model_v2.pkl") or not os.path.exists("scaler_v2.pkl"):
+    raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler_v2.pkl")
 
-rf = joblib.load("model.pkl")
-scaler = joblib.load("scaler.pkl")
+rf = joblib.load("model_v2.pkl")
+scaler = joblib.load("scaler_v2.pkl")
 print("✅ Model & scaler loaded successfully!")
 
 
