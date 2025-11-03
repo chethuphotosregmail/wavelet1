@@ -7,15 +7,15 @@ app = Flask(__name__)
 
 # -------------------- CONFIG --------------------
 ROI_SIZE = 1080
-DEBUG_SAVE = False  # set to True to save cropped ROI for inspection
+DEBUG_SAVE = False  # set to True to save cropped ROI image for inspection
 
 # -------------------- MODEL LOADING --------------------
-if not os.path.exists("model_v2.pkl") or not os.path.exists("scaler_v2.pkl"):
-    raise FileNotFoundError("⚠️ Run train_model.py first to generate model.pkl and scaler_v2.pkl")
+if not os.path.exists("model_v3.pkl") or not os.path.exists("scaler_v3.pkl"):
+    raise FileNotFoundError("⚠️ Run train_model_v3.py first to generate model_v3.pkl and scaler_v3.pkl")
 
-rf = joblib.load("model_v2.pkl")
-scaler = joblib.load("scaler_v2.pkl")
-print("✅ Model & scaler loaded successfully!")
+rf = joblib.load("model_v3.pkl")
+scaler = joblib.load("scaler_v3.pkl")
+print("✅ model_v3 & scaler_v3 loaded successfully!")
 
 
 # -------------------- 1. DETECT NOTE AREA --------------------
@@ -35,15 +35,16 @@ def detect_note_region(img):
     contour = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(contour)
 
-    if w * h < 0.2 * img.shape[0] * img.shape[1]:  # too small to be a note
+    # ignore tiny contours (likely background)
+    if w * h < 0.2 * img.shape[0] * img.shape[1]:
         return img
 
-    cropped = img[y:y+h, x:x+w]
+    cropped = img[y:y + h, x:x + w]
     return cropped
 
 
 # -------------------- 2. PREPROCESSING --------------------
-def preprocess_image(path, size=(1080, 1080)):
+def preprocess_image(path, size=(ROI_SIZE, ROI_SIZE)):
     """
     Read image, detect note, crop, convert to grayscale with CLAHE, and resize.
     """
@@ -51,13 +52,9 @@ def preprocess_image(path, size=(1080, 1080)):
     if img is None:
         raise ValueError("Invalid or unreadable image.")
 
-    # Detect and crop the main note region
     note_roi = detect_note_region(img)
-
-    # Resize to square 1080x1080
     note_roi = cv2.resize(note_roi, size)
 
-    # Grayscale and normalize lighting (CLAHE)
     gray = cv2.cvtColor(note_roi, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
@@ -87,7 +84,18 @@ def lbp_texture_features(gray):
 
 
 def extract_features(img_color, gray):
-    return np.array(wavelet_color_features(img_color) + lbp_texture_features(gray))
+    """Combine Wavelet, LBP, and clarity-reflectivity features"""
+    feats = wavelet_color_features(img_color) + lbp_texture_features(gray)
+
+    # --- clarity / reflectivity / contrast metrics ---
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()              # sharpness
+    blur = cv2.GaussianBlur(gray, (9, 9), 0)
+    contrast_map = cv2.absdiff(gray, blur)
+    contrast_std = np.std(contrast_map)                          # local contrast
+    bright_ratio = np.sum(gray > 220) / gray.size                # reflective highlights
+
+    feats.extend([lap_var, contrast_std, bright_ratio])
+    return np.array(feats)
 
 
 # -------------------- 4. FLASK ROUTES --------------------
